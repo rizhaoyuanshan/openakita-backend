@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Data & runtime
+data/*.db
+data/*.sqlite
+data/*.json
+!data/.gitkeep
+!data/llm_endpoints.json.example
+*.log
+logs/
+
+# Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
