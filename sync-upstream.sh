@@ -74,10 +74,16 @@ elif [ "$TARGET" = "frontend" ]; then
     UPSTREAM_PATH="apps/setup-center/$d"
     if git ls-tree upstream/main "$UPSTREAM_PATH" >/dev/null 2>&1; then
       git checkout upstream/main -- "$UPSTREAM_PATH" 2>/dev/null || true
-      # 移动到正确路径（去掉 apps/setup-center/ 前缀）
       if [ -e "$UPSTREAM_PATH" ]; then
         mkdir -p "$(dirname "$d")"
-        cp -r "$UPSTREAM_PATH" "$d"
+        if [ -d "$UPSTREAM_PATH" ]; then
+          # 目录：复制内容（加 /.），避免变成 src/components/components/
+          mkdir -p "$d"
+          cp -r "$UPSTREAM_PATH"/. "$d"/
+        else
+          # 文件：直接复制
+          cp "$UPSTREAM_PATH" "$d"
+        fi
         git rm -rf "$UPSTREAM_PATH" --quiet 2>/dev/null || true
         git add "$d"
         echo "  ✓ $d (from $UPSTREAM_PATH)"
