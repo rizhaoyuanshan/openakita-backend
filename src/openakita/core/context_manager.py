@@ -24,11 +24,7 @@ from .tool_executor import OVERFLOW_MARKER
 
 logger = logging.getLogger(__name__)
 CHARS_PER_TOKEN = 2  # JSON 序列化后约 2 字符 = 1 token
-MIN_RECENT_TURNS = 8  # 至少保留最近 8 组对话（工具密集型对话需要更多上下文）
-COMPRESSION_RATIO = 0.15  # 目标压缩到原上下文的 15%
-BOUNDARY_COMPRESSION_RATIO = 0.18  # 上下文边界前的旧话题压缩到 18%
 CHUNK_MAX_TOKENS = 30000  # 每次发给 LLM 压缩的单块上限
-LARGE_TOOL_RESULT_THRESHOLD = 5000  # 单条 tool_result 超过此 token 数时独立压缩
 CONTEXT_BOUNDARY_MARKER = "[上下文边界]"  # 话题切换边界标记
 
 
@@ -53,6 +49,8 @@ class ContextManager:
         """
         self._brain = brain
         self._cancel_event = cancel_event
+        self._token_cache: dict[int, int] = {}
+        self._tools_tokens_cache: int | None = None
 
     def set_cancel_event(self, event: asyncio.Event | None) -> None:
         """更新 cancel_event（每次任务开始时由 Agent 设置）"""
@@ -100,30 +98,44 @@ class ContextManager:
 
     def estimate_messages_tokens(self, messages: list[dict]) -> int:
         """
-        估算消息列表的 token 数量。
+        估算消息列表的 token 数量（with content-hash caching）。
 
         对每条消息的 content 使用与 estimate_tokens 相同的中英文感知算法，
         并为每条消息加固定结构开销（role / tool_use_id 等约 10 tokens）。
         """
         total = 0
         for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total += self.estimate_tokens(content)
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict):
-                        text = item.get("text", "") or item.get("content", "")
-                        if isinstance(text, str) and text:
-                            total += self.estimate_tokens(text)
-                        else:
-                            total += self.estimate_tokens(
-                                json.dumps(item, ensure_ascii=False, default=str)
-                            )
-                    elif isinstance(item, str):
-                        total += self.estimate_tokens(item)
-            total += 10  # 每条消息的结构开销
+            total += self._estimate_single_message_tokens(msg)
         return max(total, 1)
+
+    def _estimate_single_message_tokens(self, msg: dict) -> int:
+        """Estimate tokens for a single message with caching by content hash."""
+        content = msg.get("content", "")
+        cache_key = id(content) if not isinstance(content, str) else hash(content)
+        cached = self._token_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        tokens = 0
+        if isinstance(content, str):
+            tokens = self.estimate_tokens(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text", "") or item.get("content", "")
+                    if isinstance(text, str) and text:
+                        tokens += self.estimate_tokens(text)
+                    else:
+                        tokens += self.estimate_tokens(
+                            json.dumps(item, ensure_ascii=False, default=str)
+                        )
+                elif isinstance(item, str):
+                    tokens += self.estimate_tokens(item)
+        tokens += 10  # 每条消息的结构开销
+
+        if len(self._token_cache) < 10000:
+            self._token_cache[cache_key] = tokens
+        return tokens
 
     @staticmethod
     def group_messages(messages: list[dict]) -> list[list[dict]]:
@@ -237,7 +249,9 @@ class ContextManager:
                 f"Falling back to {min_hard_limit}."
             )
             hard_limit = min_hard_limit
-        soft_limit = int(hard_limit * 0.85)
+        from ..config import settings as _settings
+        _threshold = _settings.context_compression_threshold
+        soft_limit = int(hard_limit * _threshold)
 
         current_tokens = self.estimate_messages_tokens(messages)
 
@@ -280,11 +294,12 @@ class ContextManager:
             return result_msgs
 
         # Step 1: 对单条过大的 tool_result 独立压缩
-        messages = await self._compress_large_tool_results(messages)
-        current_tokens = self.estimate_messages_tokens(messages)
-        if current_tokens <= soft_limit:
-            logger.info(f"After tool_result compression: {current_tokens} tokens, within limit")
-            return _end_ctx_span(messages)
+        if _settings.context_enable_tool_compression:
+            messages = await self._compress_large_tool_results(messages)
+            current_tokens = self.estimate_messages_tokens(messages)
+            if current_tokens <= soft_limit:
+                logger.info(f"After tool_result compression: {current_tokens} tokens, within limit")
+                return _end_ctx_span(messages)
 
         # Step 1.5: 上下文边界感知 — 如果存在边界标记，对旧话题使用更激进的压缩
         messages = await self._compress_across_boundary(messages, soft_limit, memory_manager)
@@ -306,7 +321,7 @@ class ContextManager:
             groups = groups[:-2] + [merged]
             logger.debug("[Compress] Merged trailing assistant-question + user-answer into one group")
 
-        recent_group_count = min(MIN_RECENT_TURNS, len(groups))
+        recent_group_count = min(_settings.context_min_recent_turns, len(groups))
 
         if len(groups) <= recent_group_count:
             messages = await self._compress_large_tool_results(messages, threshold=2000)
@@ -325,7 +340,7 @@ class ContextManager:
 
         # Step 3: LLM 分块摘要早期对话
         early_tokens = self.estimate_messages_tokens(early_messages)
-        target_summary_tokens = max(int(early_tokens * COMPRESSION_RATIO), 200)
+        target_summary_tokens = max(int(early_tokens * _settings.context_compression_ratio), 200)
         summary = await self._summarize_messages_chunked(early_messages, target_summary_tokens)
 
         compressed = self._inject_summary_into_recent(summary, recent_messages)
@@ -379,7 +394,8 @@ class ContextManager:
             f"(~{pre_tokens} tokens) with aggressive ratio"
         )
 
-        target_tokens = max(int(pre_tokens * BOUNDARY_COMPRESSION_RATIO), 100)
+        from ..config import settings as _settings
+        target_tokens = max(int(pre_tokens * _settings.context_boundary_compression_ratio), 100)
         summary = await self._summarize_messages_chunked_for_boundary(
             pre_boundary, target_tokens
         )
@@ -473,54 +489,72 @@ class ContextManager:
             reset_tracking_context(_tt)
 
     async def _compress_large_tool_results(
-        self, messages: list[dict], threshold: int = LARGE_TOOL_RESULT_THRESHOLD
+        self, messages: list[dict], threshold: int | None = None
     ) -> list[dict]:
-        """对单条过大的 tool_result 内容独立 LLM 压缩"""
-        result = []
-        for msg in messages:
+        """对单条过大的 tool_result 内容并行 LLM 压缩"""
+        if threshold is None:
+            from ..config import settings as _settings
+            threshold = _settings.context_large_tool_threshold
+
+        # Phase 1: Collect all large items that need compression
+        compress_jobs: list[tuple[int, int, str, str, int]] = []  # (msg_idx, item_idx, text, type, target)
+        for msg_idx, msg in enumerate(messages):
             content = msg.get("content", "")
-            if isinstance(content, list):
-                new_content = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "tool_result":
-                        result_text = str(item.get("content", ""))
-                        # 含 OVERFLOW_MARKER 的为 handler 故意放行的长输出（如 get_skill_info），不压缩以免丢失技能全文
-                        if OVERFLOW_MARKER in result_text:
-                            new_content.append(item)
-                            continue
-                        result_tokens = self.estimate_tokens(result_text)
-                        if result_tokens > threshold:
-                            target_tokens = max(int(result_tokens * COMPRESSION_RATIO), 100)
-                            compressed_text = await self._llm_compress_text(
-                                result_text, target_tokens, context_type="tool_result"
-                            )
-                            new_item = dict(item)
-                            new_item["content"] = compressed_text
-                            new_content.append(new_item)
-                            logger.info(
-                                f"Compressed tool_result from {result_tokens} to "
-                                f"~{self.estimate_tokens(compressed_text)} tokens"
-                            )
-                        else:
-                            new_content.append(item)
-                    elif isinstance(item, dict) and item.get("type") == "tool_use":
-                        input_text = json.dumps(item.get("input", {}), ensure_ascii=False)
-                        input_tokens = self.estimate_tokens(input_text)
-                        if input_tokens > threshold:
-                            target_tokens = max(int(input_tokens * COMPRESSION_RATIO), 100)
-                            compressed_input = await self._llm_compress_text(
-                                input_text, target_tokens, context_type="tool_input"
-                            )
-                            new_item = dict(item)
-                            new_item["input"] = {"compressed_summary": compressed_input}
-                            new_content.append(new_item)
-                        else:
-                            new_content.append(item)
-                    else:
-                        new_content.append(item)
-                result.append({**msg, "content": new_content})
-            else:
-                result.append(msg)
+            if not isinstance(content, list):
+                continue
+            for item_idx, item in enumerate(content):
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    result_text = str(item.get("content", ""))
+                    if OVERFLOW_MARKER in result_text:
+                        continue
+                    result_tokens = self.estimate_tokens(result_text)
+                    if result_tokens > threshold:
+                        from ..config import settings as _s
+                        target_tokens = max(int(result_tokens * _s.context_compression_ratio), 100)
+                        compress_jobs.append((msg_idx, item_idx, result_text, "tool_result", target_tokens))
+                elif isinstance(item, dict) and item.get("type") == "tool_use":
+                    input_text = json.dumps(item.get("input", {}), ensure_ascii=False)
+                    input_tokens = self.estimate_tokens(input_text)
+                    if input_tokens > threshold:
+                        from ..config import settings as _s
+                        target_tokens = max(int(input_tokens * _s.context_compression_ratio), 100)
+                        compress_jobs.append((msg_idx, item_idx, input_text, "tool_input", target_tokens))
+
+        if not compress_jobs:
+            return messages
+
+        # Phase 2: Parallel compression
+        async def _compress_one(text: str, ctx_type: str, target: int) -> str:
+            return await self._llm_compress_text(text, target, context_type=ctx_type)
+
+        tasks = [_compress_one(text, ctx_type, target) for _, _, text, ctx_type, target in compress_jobs]
+        compressed_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Phase 3: Apply compressed results back
+        result = [dict(msg) for msg in messages]
+        for job, compressed in zip(compress_jobs, compressed_results):
+            msg_idx, item_idx, original_text, ctx_type, _ = job
+            if isinstance(compressed, Exception):
+                logger.warning(f"Tool result compression failed: {compressed}")
+                continue
+
+            msg = result[msg_idx]
+            content = list(msg.get("content", []))
+            item = dict(content[item_idx])
+            original_tokens = self.estimate_tokens(original_text)
+
+            if ctx_type == "tool_result":
+                item["content"] = compressed
+                logger.info(
+                    f"Compressed tool_result from {original_tokens} to "
+                    f"~{self.estimate_tokens(compressed)} tokens"
+                )
+            elif ctx_type == "tool_input":
+                item["input"] = {"compressed_summary": compressed}
+
+            content[item_idx] = item
+            result[msg_idx] = {**msg, "content": content}
+
         return result
 
     async def _llm_compress_text(
@@ -666,11 +700,10 @@ class ContextManager:
 
         logger.info(f"Splitting {len(messages)} messages into {len(chunks)} chunks for compression")
 
-        chunk_summaries = []
-        for i, chunk in enumerate(chunks):
-            chunk_tokens = self.estimate_tokens(chunk)
-            chunk_target = max(int(target_tokens / len(chunks)), 100)
+        chunk_target = max(int(target_tokens / len(chunks)), 100)
 
+        async def _summarize_one_chunk(i: int, chunk: str) -> str:
+            chunk_tokens = self.estimate_tokens(chunk)
             _tt2 = set_tracking_context(TokenTrackingContext(
                 operation_type="context_compress",
                 operation_detail=f"chunk_{i}",
@@ -685,13 +718,18 @@ class ContextManager:
                         "1. **对话背景**: 用户的原始目标\n"
                         "2. **用户需求**: 用户明确提出的要求和指令\n"
                         "3. **已完成的步骤**: 执行了哪些操作，结果如何（成功/失败/错误信息）\n"
-                        "4. **当前任务进度**: 进行到哪一步了\n"
-                        "5. **待处理的问题**: AI 向用户提出了什么问题，用户是否已回答（保留原文）\n"
-                        "6. **关键配置/数值**: 端口号、路径、密钥、版本号等具体值（必须保留原始数值）\n"
-                        "7. **下一步计划**: 接下来要做什么\n"
-                        "8. **用户设定的行为规则**: 用户明确要求的持久约束"
+                        "4. **成功的方法**: 最终验证有效的方案、配置、代码片段（最高优先级保留）\n"
+                        "5. **错误→修复**: 遇到什么错误，通过什么改动修复的\n"
+                        "6. **当前任务进度**: 进行到哪一步了\n"
+                        "7. **待处理的问题**: AI 向用户提出了什么问题，用户是否已回答（保留原文）\n"
+                        "8. **关键配置/数值**: 端口号、路径、密钥、版本号等具体值（必须保留原始数值）\n"
+                        "9. **下一步计划**: 接下来要做什么\n"
+                        "10. **用户设定的行为规则**: 用户明确要求的持久约束"
                         "（如「每次先做X」「不要Y」「必须先Z」等），必须原文保留，不可省略或模糊化\n\n"
-                        "重要：保留所有具体数值和配置信息，不要用模糊描述代替具体值。"
+                        "重要：\n"
+                        "- 保留所有具体数值和配置信息，不要用模糊描述代替具体值\n"
+                        "- 如果某个方案最终成功了，必须完整保留该方案的关键步骤和参数\n"
+                        "- 失败的尝试可以简化为一句话，但成功的方案必须详细保留"
                     ),
                     messages=[
                         {
@@ -717,32 +755,35 @@ class ContextManager:
                 if not summary.strip():
                     logger.warning(f"[Compress] Chunk {i + 1} returned empty summary")
                     max_chars = chunk_target * CHARS_PER_TOKEN
-                    if len(chunk) > max_chars:
-                        chunk_summaries.append(
-                            chunk[: max_chars // 2] + "\n...(摘要失败，已截断)...\n"
-                        )
-                    else:
-                        chunk_summaries.append(chunk)
-                else:
-                    chunk_summaries.append(summary.strip())
-                    logger.info(
-                        f"Chunk {i + 1}/{len(chunks)}: {chunk_tokens} -> "
-                        f"~{self.estimate_tokens(summary)} tokens"
-                    )
+                    return chunk[: max_chars // 2] + "\n...(摘要失败，已截断)...\n" if len(chunk) > max_chars else chunk
+                logger.info(
+                    f"Chunk {i + 1}/{len(chunks)}: {chunk_tokens} -> "
+                    f"~{self.estimate_tokens(summary)} tokens"
+                )
+                return summary.strip()
 
             except _CancelledError:
                 raise
             except Exception as e:
                 logger.warning(f"Failed to summarize chunk {i + 1}: {e}")
                 max_chars = chunk_target * CHARS_PER_TOKEN
-                if len(chunk) > max_chars:
-                    chunk_summaries.append(
-                        chunk[: max_chars // 2] + "\n...(摘要失败，已截断)...\n"
-                    )
-                else:
-                    chunk_summaries.append(chunk)
+                return chunk[: max_chars // 2] + "\n...(摘要失败，已截断)...\n" if len(chunk) > max_chars else chunk
             finally:
                 reset_tracking_context(_tt2)
+
+        # Parallel summarization
+        tasks = [_summarize_one_chunk(i, chunk) for i, chunk in enumerate(chunks)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        chunk_summaries = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.warning(f"Chunk {i + 1} summarization raised: {result}")
+                max_chars = chunk_target * CHARS_PER_TOKEN
+                fallback = chunks[i][:max_chars // 2] + "\n...(摘要异常)...\n" if len(chunks[i]) > max_chars else chunks[i]
+                chunk_summaries.append(fallback)
+            else:
+                chunk_summaries.append(result)
 
         combined = "\n---\n".join(chunk_summaries)
         combined_tokens = self.estimate_tokens(combined)
@@ -775,7 +816,8 @@ class ContextManager:
         recent_messages = [msg for group in recent_groups for msg in group]
 
         early_tokens = self.estimate_messages_tokens(early_messages)
-        target = max(int(early_tokens * COMPRESSION_RATIO), 100)
+        from ..config import settings as _settings
+        target = max(int(early_tokens * _settings.context_compression_ratio), 100)
         summary = await self._summarize_messages_chunked(early_messages, target)
 
         compressed = self._inject_summary_into_recent(summary, recent_messages)
@@ -888,7 +930,10 @@ class ContextManager:
     def _hard_truncate_if_needed(
         self, messages: list[dict], hard_limit: int, memory_manager: object | None = None
     ) -> list[dict]:
-        """硬保底：当 LLM 压缩后仍超过 hard_limit，直接硬截断"""
+        """硬保底：当 LLM 压缩后仍超过 hard_limit，直接硬截断。
+
+        Uses prefix-sum + binary search for O(n log n) instead of O(n^2).
+        """
         current_tokens = self.estimate_messages_tokens(messages)
         if current_tokens <= hard_limit:
             return messages
@@ -898,12 +943,32 @@ class ContextManager:
             f"Applying hard truncation."
         )
 
-        truncated = list(messages)
-        dropped_messages: list[dict] = []
-        while len(truncated) > 2 and self.estimate_messages_tokens(truncated) > hard_limit:
-            removed = truncated.pop(0)
-            dropped_messages.append(removed)
-            logger.warning(f"[HardTruncate] Dropped earliest message (role={removed.get('role', '?')})")
+        # Build per-message token array and suffix sum
+        n = len(messages)
+        msg_tokens = [self._estimate_single_message_tokens(msg) for msg in messages]
+
+        # Binary search: find smallest k such that sum(msg_tokens[k:]) <= hard_limit
+        # Suffix sum: suffix[i] = sum(msg_tokens[i:])
+        suffix = [0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            suffix[i] = suffix[i + 1] + msg_tokens[i]
+
+        # Find the smallest start index where suffix fits budget (keep at least 2 messages)
+        drop_until = 0
+        max_drop = max(0, n - 2)
+        lo, hi = 0, max_drop
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if suffix[mid] <= hard_limit:
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        drop_until = lo
+
+        truncated = list(messages[drop_until:])
+        dropped_messages = list(messages[:drop_until])
+        if dropped_messages:
+            logger.warning(f"[HardTruncate] Dropped {len(dropped_messages)} earliest messages")
 
         # 将被丢弃的消息入队到提取队列，避免永久丢失
         if dropped_messages and memory_manager is not None:

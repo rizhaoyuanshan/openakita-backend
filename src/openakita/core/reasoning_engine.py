@@ -43,6 +43,7 @@ from .resource_budget import BudgetAction, ResourceBudget, create_budget_from_se
 from .supervisor import RuntimeSupervisor
 from .token_tracking import TokenTrackingContext, reset_tracking_context, set_tracking_context
 from .tool_executor import ToolExecutor
+from ..api.routes.websocket import broadcast_event
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,11 @@ class ReasoningEngine:
         # Checkpoint 管理
         self._checkpoints: list[Checkpoint] = []
         self._tool_failure_counter: dict[str, int] = {}  # tool_name -> consecutive_failures
+
+        # 跨 rollback 的持久性失败计数器（rollback 不会清除）
+        # 用于检测 "write_file 因截断反复失败" 等跨 rollback 循环
+        self._persistent_tool_failures: dict[str, int] = {}
+        self.PERSISTENT_FAIL_LIMIT = 5  # 同一工具跨 rollback 累计失败 N 次强制终止
 
         # 思维链: 暂存最近一次推理的 react_trace，供 agent_handler 读取
         self._last_react_trace: list[dict] = []
@@ -350,9 +356,14 @@ class ReasoningEngine:
         """记录工具执行结果，用于连续失败检测。"""
         if success:
             self._tool_failure_counter[tool_name] = 0
+            # 成功时也重置持久计数器
+            self._persistent_tool_failures.pop(tool_name, None)
         else:
             self._tool_failure_counter[tool_name] = (
                 self._tool_failure_counter.get(tool_name, 0) + 1
+            )
+            self._persistent_tool_failures[tool_name] = (
+                self._persistent_tool_failures.get(tool_name, 0) + 1
             )
 
     def _should_rollback(self, tool_results: list[dict]) -> tuple[bool, str]:
@@ -373,12 +384,16 @@ class ReasoningEngine:
         batch_failures = []
         for result in tool_results:
             content = ""
+            # 主信号: tool_result 的结构化 is_error 标志
+            is_error_flag = False
             if isinstance(result, dict):
                 content = str(result.get("content", ""))
+                is_error_flag = result.get("is_error", False)
             elif isinstance(result, str):
                 content = result
 
-            has_error = any(marker in content for marker in [
+            # 兜底: 字符串标记匹配（handler 返回的错误字符串）
+            has_error = is_error_flag or any(marker in content for marker in [
                 "❌", "⚠️ 工具执行错误", "错误类型:", "ToolError", "⚠️ 策略拒绝:",
             ])
             has_success = any(marker in content for marker in [
@@ -424,6 +439,8 @@ class ReasoningEngine:
             f"失败的决策: {cp.decision_summary}。"
             f"请尝试完全不同的方法来完成任务。"
             f"避免使用与之前相同的工具参数组合。"
+            f"如果是因为工具参数被 API 截断（如 write_file 内容过长），"
+            f"请将内容拆分为多次小写入。"
         )
         restored_messages.append({
             "role": "user",
@@ -457,6 +474,8 @@ class ReasoningEngine:
         progress_callback: Any = None,
         agent_profile_id: str = "default",
         endpoint_override: str | None = None,
+        force_tool_retries: int | None = None,
+        is_sub_agent: bool = False,
     ) -> str:
         """
         主推理循环: Reason -> Act -> Observe。
@@ -475,6 +494,8 @@ class ReasoningEngine:
             thinking_depth: 思考深度 ('low'/'medium'/'high'/None)
             progress_callback: 进度回调 async fn(str) -> None，用于 IM 实时输出思维链
             endpoint_override: 端点覆盖（来自 Agent profile 或 API 请求）
+            force_tool_retries: Intent-driven override for max ForceToolCall retries
+                (None = use default from settings, 0 = disable ForceToolCall)
 
         Returns:
             最终响应文本
@@ -515,6 +536,7 @@ class ReasoningEngine:
         })
 
         max_iterations = settings.max_iterations
+        self._empty_content_retries = 0
 
         # 进度回调辅助（安全调用，忽略异常）
         async def _emit_progress(text: str) -> None:
@@ -553,15 +575,22 @@ class ReasoningEngine:
                     logger.warning(f"[EndpointOverride] Failed to switch to {endpoint_override}: {msg}, using default")
 
         # ForceToolCall 配置
-        # IM 保留至少 2 次重试，防止模型声称执行了操作但未调用工具（幻觉）
+        im_floor = max(0, int(getattr(settings, "force_tool_call_im_floor", 1)))
+        configured = int(getattr(settings, "force_tool_call_max_retries", 1))
         if session_type == "im":
-            base_force_retries = max(2, int(getattr(settings, "force_tool_call_max_retries", 2)))
+            base_force_retries = max(im_floor, configured)
         else:
-            base_force_retries = max(0, int(getattr(settings, "force_tool_call_max_retries", 2)))
+            base_force_retries = max(0, configured)
 
         max_no_tool_retries = self._effective_force_retries(base_force_retries, conversation_id)
+
+        # Intent-driven override (from IntentAnalyzer)
+        if force_tool_retries is not None:
+            max_no_tool_retries = force_tool_retries
+            logger.info(f"[ForceToolCall] Intent override: max_retries={force_tool_retries}")
+
         max_verify_retries = 3
-        max_confirmation_text_retries = 2
+        max_confirmation_text_retries = max(0, int(getattr(settings, "confirmation_text_max_retries", 2)))
 
         # 追踪变量
         executed_tool_names: list[str] = []
@@ -574,12 +603,6 @@ class ReasoningEngine:
         verify_incomplete_count = 0
         no_confirmation_text_count = 0
         tools_executed_in_task = False
-
-        # 循环检测
-        recent_tool_signatures: list[str] = []
-        tool_pattern_window = 8
-        llm_self_check_interval = 10
-        extreme_safety_threshold = 50
 
         def _build_effective_system_prompt() -> str:
             """动态追加活跃 Plan"""
@@ -673,7 +696,6 @@ class ReasoningEngine:
                     verify_incomplete_count = 0
                     executed_tool_names = []
                     consecutive_tool_rounds = 0
-                    recent_tool_signatures = []
                     no_confirmation_text_count = 0
 
             _ctx_compressed_info: dict | None = None
@@ -747,6 +769,7 @@ class ReasoningEngine:
                     working_messages, _build_effective_system_prompt(), current_model, state
                 )
             logger.info(f"[ReAct] Iter {iteration+1}/{max_iterations} — REASON (model={current_model})")
+            await broadcast_event("pet-status-update", {"status": "thinking"})
             if state.status != TaskStatus.REASONING:
                 try:
                     state.transition(TaskStatus.REASONING)
@@ -799,10 +822,10 @@ class ReasoningEngine:
                     verify_incomplete_count = 0
                     executed_tool_names = []
                     consecutive_tool_rounds = 0
-                    recent_tool_signatures = []
                     no_confirmation_text_count = 0
                     continue
                 else:
+                    await broadcast_event("pet-status-update", {"status": "error"})
                     raise
 
             _thinking_duration_ms = int((time.time() - _thinking_t0) * 1000)
@@ -921,6 +944,7 @@ class ReasoningEngine:
                         "iterations": iteration + 1,
                         "tools_used": list(set(executed_tool_names)),
                     })
+                    await broadcast_event("pet-status-update", {"status": "success"})
                     return result
                 else:
                     # 需要继续循环（验证不通过）
@@ -944,6 +968,7 @@ class ReasoningEngine:
                 # ==================== ACT 阶段 ====================
                 tool_names = [tc.get("name", "?") for tc in decision.tool_calls]
                 logger.info(f"[ReAct] Iter {iteration+1} — ACT: {tool_names}")
+                await broadcast_event("pet-status-update", {"status": "tool_execution", "tool_name": ", ".join(tool_names)})
                 try:
                     state.transition(TaskStatus.ACTING)
                 except ValueError:
@@ -1028,6 +1053,8 @@ class ReasoningEngine:
                         state.transition(TaskStatus.WAITING_USER)
                     except ValueError:
                         pass
+
+                    await broadcast_event("pet-status-update", {"status": "idle"})
 
                     # ---- IM 模式：等待用户回复（超时 + 追问） ----
                     user_reply = await self._wait_for_user_reply(
@@ -1151,10 +1178,15 @@ class ReasoningEngine:
                 for i, tc in enumerate(decision.tool_calls):
                     _tc_name = tc.get("name", "")
                     result_content = ""
+                    is_error = False
                     if i < len(tool_results):
                         r = tool_results[i]
                         result_content = str(r.get("content", "")) if isinstance(r, dict) else str(r)
-                    is_error = any(m in result_content for m in ["❌", "⚠️ 工具执行错误", "错误类型:", "⚠️ 策略拒绝:"])
+                        # 主信号: tool_result 的结构化 is_error 标志
+                        is_error = r.get("is_error", False) if isinstance(r, dict) else False
+                    # 兜底: 字符串标记匹配（handler 返回的错误字符串）
+                    if not is_error and result_content:
+                        is_error = any(m in result_content for m in ["❌", "⚠️ 工具执行错误", "错误类型:", "⚠️ 策略拒绝:"])
                     self._record_tool_result(_tc_name, success=not is_error)
                     _r_summary = self._summarize_tool_result(_tc_name, result_content)
                     if _r_summary:
@@ -1198,6 +1230,35 @@ class ReasoningEngine:
                         logger.info(f"[ReAct] Iter {iteration+1} — tool_result id={t_id} len={r_len}")
                 react_trace.append(_iter_trace)
 
+                # 持久性失败检测：跨 rollback 累计同一工具失败达上限时，
+                # 注入强制策略切换提示而非继续回滚（防止截断导致的无限循环）
+                _persistent_exceeded = {
+                    name: count for name, count in self._persistent_tool_failures.items()
+                    if count >= self.PERSISTENT_FAIL_LIMIT
+                }
+                if _persistent_exceeded:
+                    _tool_names = ", ".join(_persistent_exceeded.keys())
+                    _hint = (
+                        f"[系统提示] 工具 {_tool_names} 累计失败已达 {self.PERSISTENT_FAIL_LIMIT} 次"
+                        f"（含跨回滚），通常是因为参数过长被 API 截断。"
+                        "你必须改用完全不同的策略：\n"
+                        "- 使用 run_shell 执行 Python 脚本来生成大文件\n"
+                        "- 将内容拆分成多次小写入\n"
+                        "- 先写骨架，再逐步填充\n"
+                        "禁止再次用同样方式调用该工具。"
+                    )
+                    working_messages.append({"role": "user", "content": tool_results})
+                    working_messages.append({"role": "user", "content": _hint})
+                    logger.warning(
+                        f"[PersistentFail] {_tool_names} exceeded persistent fail limit "
+                        f"({self.PERSISTENT_FAIL_LIMIT}), injecting strategy switch"
+                    )
+                    # 重置计数器以给新策略一次机会
+                    for name in _persistent_exceeded:
+                        self._persistent_tool_failures[name] = 0
+                    self._tool_failure_counter.clear()
+                    continue
+
                 # 检查是否应该回滚
                 should_rb, rb_reason = self._should_rollback(tool_results)
                 if should_rb:
@@ -1226,10 +1287,13 @@ class ReasoningEngine:
                 for i, tc in enumerate(decision.tool_calls):
                     _tc_name = tc.get("name", "")
                     result_content = ""
+                    is_error = False
                     if i < len(tool_results):
                         r = tool_results[i]
                         result_content = str(r.get("content", "")) if isinstance(r, dict) else str(r)
-                    is_error = any(m in result_content for m in ["❌", "⚠️ 工具执行错误", "错误类型:", "⚠️ 策略拒绝:"])
+                        is_error = r.get("is_error", False) if isinstance(r, dict) else False
+                    if not is_error and result_content:
+                        is_error = any(m in result_content for m in ["❌", "⚠️ 工具执行错误", "错误类型:", "⚠️ 策略拒绝:"])
                     self._supervisor.record_tool_call(
                         tool_name=_tc_name, params=tc.get("input", {}),
                         success=not is_error, iteration=iteration,
@@ -1265,9 +1329,6 @@ class ReasoningEngine:
                 # 工具签名循环检测 (Supervisor-based)
                 round_signatures = [_make_tool_signature(tc) for tc in decision.tool_calls]
                 round_sig_str = "+".join(sorted(round_signatures))
-                recent_tool_signatures.append(round_sig_str)
-                if len(recent_tool_signatures) > tool_pattern_window:
-                    recent_tool_signatures = recent_tool_signatures[-tool_pattern_window:]
                 self._supervisor.record_tool_signature(round_sig_str)
 
                 # Supervisor 综合评估
@@ -1339,6 +1400,7 @@ class ReasoningEngine:
             task_description=task_description,
             task_id=state.task_id,
         )
+        await broadcast_event("pet-status-update", {"status": "error"})
         return "已达到最大工具调用次数，请重新描述您的需求。"
 
     # ==================== 流式输出 (SSE) ====================
@@ -1360,6 +1422,8 @@ class ReasoningEngine:
         thinking_depth: str | None = None,
         agent_profile_id: str = "default",
         session: Any = None,
+        force_tool_retries: int | None = None,
+        is_sub_agent: bool = False,
     ):
         """
         流式推理循环，为 HTTP API (SSE) 设计。
@@ -1469,18 +1533,26 @@ class ReasoningEngine:
                 msg for msg in messages if self._is_human_user_message(msg)
             ]
             max_iterations = settings.max_iterations
+            self._empty_content_retries = 0
             working_messages = list(messages)
 
             # ForceToolCall 配置
-            # IM 保留至少 2 次重试，防止模型声称执行了操作但未调用工具（幻觉）
+            im_floor = max(0, int(getattr(settings, "force_tool_call_im_floor", 1)))
+            configured = int(getattr(settings, "force_tool_call_max_retries", 1))
             if session_type == "im":
-                base_force_retries = max(2, int(getattr(settings, "force_tool_call_max_retries", 2)))
+                base_force_retries = max(im_floor, configured)
             else:
-                base_force_retries = max(0, int(getattr(settings, "force_tool_call_max_retries", 2)))
+                base_force_retries = max(0, configured)
 
             max_no_tool_retries = self._effective_force_retries(base_force_retries, conversation_id)
+
+            # Intent-driven override (from IntentAnalyzer)
+            if force_tool_retries is not None:
+                max_no_tool_retries = force_tool_retries
+                logger.info(f"[ForceToolCall/Stream] Intent override: max_retries={force_tool_retries}")
+
             max_verify_retries = 3
-            max_confirmation_text_retries = 2
+            max_confirmation_text_retries = max(0, int(getattr(settings, "confirmation_text_max_retries", 2)))
 
             executed_tool_names: list[str] = []
             delivery_receipts: list[dict] = []
@@ -1490,12 +1562,6 @@ class ReasoningEngine:
             verify_incomplete_count = 0
             no_confirmation_text_count = 0
             tools_executed_in_task = False
-
-            # 循环检测
-            recent_tool_signatures: list[str] = []
-            tool_pattern_window = 8
-            llm_self_check_interval = 10
-            extreme_safety_threshold = 50
 
             def _make_tool_sig(tc: dict) -> str:
                 nonlocal _last_browser_url
@@ -1567,7 +1633,6 @@ class ReasoningEngine:
                         verify_incomplete_count = 0
                         executed_tool_names = []
                         consecutive_tool_rounds = 0
-                        recent_tool_signatures = []
                         no_confirmation_text_count = 0
 
                 logger.info(
@@ -1649,6 +1714,7 @@ class ReasoningEngine:
                 # --- Reason phase ---
                 _thinking_t0 = time.time()
                 yield {"type": "thinking_start"}
+                await broadcast_event("pet-status-update", {"status": "thinking"})
 
                 try:
                     decision = None
@@ -1725,7 +1791,6 @@ class ReasoningEngine:
                         verify_incomplete_count = 0
                         executed_tool_names = []
                         consecutive_tool_rounds = 0
-                        recent_tool_signatures = []
                         no_confirmation_text_count = 0
                         continue
                     else:
@@ -1838,6 +1903,7 @@ class ReasoningEngine:
                         for i in range(0, len(result), chunk_size):
                             yield {"type": "text_delta", "content": result[i:i + chunk_size]}
                             await asyncio.sleep(0.01)
+                        await broadcast_event("pet-status-update", {"status": "success"})
                         yield {"type": "done"}
                         return
                     else:
@@ -1887,6 +1953,7 @@ class ReasoningEngine:
                             # chain_text: 工具描述
                             yield {"type": "chain_text", "content": self._describe_tool_call(t_name, t_args)}
                             yield {"type": "tool_call_start", "tool": t_name, "args": t_args, "id": t_id}
+                            await broadcast_event("pet-status-update", {"status": "tool_execution", "tool_name": t_name})
                             # PolicyEngine 检查
                             from .policy import PolicyDecision, get_policy_engine
                             _pe = get_policy_engine()
@@ -1964,6 +2031,8 @@ class ReasoningEngine:
                                 parsed_questions.append(pq)
                             if parsed_questions:
                                 event["questions"] = parsed_questions
+                        
+                        await broadcast_event("pet-status-update", {"status": "idle"})
                         yield event
                         react_trace.append(_iter_trace)
                         self._save_react_trace(
@@ -1998,11 +2067,13 @@ class ReasoningEngine:
                         yield {"type": "chain_text", "content": _tool_desc}
 
                         yield {"type": "tool_call_start", "tool": tool_name, "args": tool_args, "id": tool_id}
+                        await broadcast_event("pet-status-update", {"status": "tool_execution", "tool_name": tool_name})
 
                         # PolicyEngine 检查（与 execute_batch 一致）
                         from .policy import PolicyDecision, get_policy_engine
                         _pe = get_policy_engine()
-                        _pr = _pe.assert_tool_allowed(tool_name, tool_args if isinstance(tool_args, dict) else {})
+                        _tool_args_dict = tool_args if isinstance(tool_args, dict) else {}
+                        _pr = _pe.assert_tool_allowed(tool_name, _tool_args_dict)
                         if _pr.decision == PolicyDecision.DENY:
                             result_text = f"⚠️ 策略拒绝: {_pr.reason}"
                             yield {
@@ -2013,6 +2084,37 @@ class ReasoningEngine:
                             _deny_summary = self._summarize_tool_result(tool_name, result_text)
                             if _deny_summary:
                                 yield {"type": "chain_text", "content": _deny_summary}
+                            tool_results_for_msg.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": result_text,
+                                "is_error": True,
+                            })
+                            continue
+
+                        if _pr.decision == PolicyDecision.CONFIRM:
+                            _risk = _pr.metadata.get("risk_level", "HIGH")
+                            _needs_sb = _pr.metadata.get("needs_sandbox", False)
+                            _pe.store_ui_pending(tool_id, tool_name, _tool_args_dict)
+                            yield {
+                                "type": "security_confirm",
+                                "tool": tool_name,
+                                "args": _tool_args_dict,
+                                "id": tool_id,
+                                "reason": _pr.reason,
+                                "risk_level": _risk,
+                                "needs_sandbox": _needs_sb,
+                            }
+                            result_text = (
+                                f"⚠️ 需要用户确认: {_pr.reason}\n"
+                                "请使用 ask_user 工具询问用户是否允许此操作，"
+                                "得到用户同意后再重新调用此工具。"
+                            )
+                            yield {
+                                "type": "tool_call_end", "tool": tool_name,
+                                "result": result_text[:_SSE_RESULT_PREVIEW_CHARS],
+                                "id": tool_id, "is_error": True,
+                            }
                             tool_results_for_msg.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
@@ -2269,9 +2371,6 @@ class ReasoningEngine:
                     # Supervisor 综合评估
                     round_signatures = [_make_tool_sig(tc) for tc in decision.tool_calls]
                     round_sig_str = "+".join(sorted(round_signatures))
-                    recent_tool_signatures.append(round_sig_str)
-                    if len(recent_tool_signatures) > tool_pattern_window:
-                        recent_tool_signatures = recent_tool_signatures[-tool_pattern_window:]
                     self._supervisor.record_tool_signature(round_sig_str)
 
                     _has_plan_s = self._has_active_plan_pending(conversation_id)
@@ -2350,6 +2449,7 @@ class ReasoningEngine:
                 f"error: {str(e)[:100]}", _trace_started_at,
             )
             yield {"type": "error", "message": str(e)[:500]}
+            await broadcast_event("pet-status-update", {"status": "error"})
             yield {"type": "done"}
 
         finally:
@@ -3127,22 +3227,31 @@ class ReasoningEngine:
             f"text_preview=\"{(stripped_text or '')[:80].replace(chr(10), ' ')}\""
         )
 
-        # 确认式回复检测：模型在向用户确认信息（如语音识别结果、执行计划），
-        # 而非遗漏工具调用。此时 ForceToolCall 重试毫无意义，只会浪费 token 并
-        # 生成重复内容。直接返回给用户即可。
-        if stripped_text and self._is_confirmation_response(stripped_text):
-            logger.info(
-                "[IntentTag] Confirmation-style response detected, "
-                "skipping ForceToolCall retries"
+        # Model glitch: LLM returned empty content (content: []) but consumed
+        # output tokens on internal reasoning. Retry silently without counting
+        # against the ForceToolCall budget.
+        _empty_retry_attr = "_empty_content_retries"
+        empty_retries = getattr(self, _empty_retry_attr, 0)
+        if (
+            not stripped_text
+            and not decision.thinking_content
+            and intent is None
+            and empty_retries < 2
+        ):
+            setattr(self, _empty_retry_attr, empty_retries + 1)
+            logger.warning(
+                f"[EmptyContent] LLM returned empty content (attempt {empty_retries + 1}/2), "
+                f"silent retry without counting against ForceToolCall budget"
             )
-            return clean_llm_response(stripped_text)
+            working_messages.append({
+                "role": "user",
+                "content": "[系统] 你的上一次回复为空。请直接回复用户的问题。",
+            })
+            return (working_messages, no_tool_call_count, verify_incomplete_count,
+                    no_confirmation_text_count, max_no_tool_retries)
 
-        # [REPLY] 允许 1 次重试（防止模型错误使用 REPLY 跳过工具调用）
-        # [ACTION] 或无标记 → 使用完整重试次数（默认 2 次）
-        if intent == "REPLY":
-            max_no_tool_retries = 1
-        else:
-            max_no_tool_retries = self._effective_force_retries(base_force_retries, conversation_id)
+        # [REPLY] / [ACTION] / 无标记 → 统一使用配置的重试次数
+        max_no_tool_retries = self._effective_force_retries(base_force_retries, conversation_id)
         no_tool_call_count += 1
 
         if no_tool_call_count <= max_no_tool_retries:
@@ -3193,82 +3302,6 @@ class ReasoningEngine:
         )
 
     # ==================== 循环检测 ====================
-
-    def _detect_loops(
-        self,
-        recent_signatures: list[str],
-        consecutive_rounds: int,
-        working_messages: list[dict],
-        text_content: str,
-        self_check_interval: int,
-        extreme_threshold: int,
-        conversation_id: str | None,
-    ) -> str | None:
-        """
-        循环检测。
-
-        Returns:
-            "terminate" - 终止循环
-            "disable_force" - 禁用 ForceToolCall
-            None - 继续
-        """
-        # 签名重复检测
-        if len(recent_signatures) >= 3:
-            from collections import Counter
-            sig_counts = Counter(recent_signatures)
-            most_common_sig, most_common_count = sig_counts.most_common(1)[0]
-
-            if most_common_count >= 3:
-                logger.warning(
-                    f"[LoopGuard] True loop: '{most_common_sig}' repeated {most_common_count} times"
-                )
-                working_messages.append({
-                    "role": "user",
-                    "content": (
-                        "[系统提示] 你在最近几轮中用完全相同的参数重复调用了同一个工具。"
-                        "请评估：1. 任务已完成则停止调用。2. 遇到困难则换方法。"
-                    ),
-                })
-
-                if most_common_count >= 5:
-                    logger.error(f"[LoopGuard] Dead loop ({most_common_count} repeats). Terminating.")
-                    return "terminate"
-
-        # 定期 LLM 自检
-        if consecutive_rounds > 0 and consecutive_rounds % self_check_interval == 0:
-            has_plan = self._has_active_plan_pending(conversation_id)
-            if has_plan:
-                working_messages.append({
-                    "role": "user",
-                    "content": (
-                        f"[系统提示] 已连续执行 {consecutive_rounds} 轮，Plan 仍有未完成步骤。"
-                        "如果遇到困难，请换一种方法继续推进。"
-                    ),
-                })
-            else:
-                working_messages.append({
-                    "role": "user",
-                    "content": (
-                        f"[系统提示] 你已连续执行了 {consecutive_rounds} 轮工具调用。请自我评估：\n"
-                        "1. 当前任务进度如何？\n"
-                        "2. 是否陷入了循环？\n"
-                        "3. 如果任务已完成，请停止工具调用，直接回复用户。"
-                    ),
-                })
-
-        # 极端安全阈值
-        if consecutive_rounds == extreme_threshold:
-            logger.warning(f"[LoopGuard] Extreme safety threshold ({extreme_threshold})")
-            working_messages.append({
-                "role": "user",
-                "content": (
-                    f"[系统提示] 当前任务已连续执行了 {extreme_threshold} 轮。"
-                    "请向用户汇报进度并询问是否继续。"
-                ),
-            })
-            return "disable_force"
-
-        return None
 
     # ==================== 模型切换 ====================
 
@@ -3570,27 +3603,6 @@ class ReasoningEngine:
             }
             return "tool_result" not in part_types
         return False
-
-    @staticmethod
-    def _is_confirmation_response(text: str) -> bool:
-        """检测模型回复是否为确认式回复（要求用户确认后再执行）。
-
-        典型场景：语音识别后确认识别结果、复述执行计划等待确认。
-        这类回复不应触发 ForceToolCall 重试——模型是有意征询用户意见。
-        """
-        import re
-        _text = text.strip()
-        if len(_text) < 10:
-            return False
-        _tail = _text[-200:] if len(_text) > 200 else _text
-        confirmation_patterns = [
-            r"确认后.*(?:回复|发送|输入)",
-            r"请(?:回复|发送|输入).*[\"「]?确认[\"」]?",
-            r"(?:是否|请)确认",
-            r"请确认以上",
-            r"确认.*(?:准确|正确|无误)",
-        ]
-        return any(re.search(pat, _tail) for pat in confirmation_patterns)
 
     @staticmethod
     def _effective_force_retries(base_retries: int, conversation_id: str | None) -> int:

@@ -62,6 +62,14 @@ class Settings(BaseSettings):
         default=1,
         description="当模型未调用工具时，最多追问要求调用工具的次数（0=禁用）",
     )
+    force_tool_call_im_floor: int = Field(
+        default=1,
+        description="IM 通道的 ForceToolCall 最低重试次数（0=与全局一致，不强制下限）",
+    )
+    confirmation_text_max_retries: int = Field(
+        default=2,
+        description="工具执行后无可见文本时的最大追问次数（0=禁用）",
+    )
 
     # === 工具并行执行 ===
     # 单轮模型返回多个 tool_use/tool_calls 时，Agent 可选择并行执行工具以提升吞吐。
@@ -412,6 +420,36 @@ class Settings(BaseSettings):
         description="Local device identifier (auto-generated UUID)",
     )
 
+    # === 上下文管理配置 ===
+    context_max_window: int = Field(
+        default=0,
+        description="全局上下文最大输入长度 (tokens)。实际生效时取 min(此值, 端点 context_window)。0=不限制，直接使用端点上限",
+    )
+    context_compression_ratio: float = Field(
+        default=0.25,
+        description="上下文压缩目标比例，早期对话压缩到原文的该百分比 (0.05~0.5)",
+    )
+    context_compression_threshold: float = Field(
+        default=0.85,
+        description="触发压缩的软限比例——上下文 token 数超过硬上限的该比例时开始压缩 (0.5~0.95，越大越晚触发)",
+    )
+    context_boundary_compression_ratio: float = Field(
+        default=0.25,
+        description="跨话题边界压缩比例，旧话题压缩到该百分比 (0.05~0.5)",
+    )
+    context_min_recent_turns: int = Field(
+        default=12,
+        description="压缩时至少保留的最近对话组数 (4~20)",
+    )
+    context_enable_tool_compression: bool = Field(
+        default=True,
+        description="是否启用超长工具结果独立压缩",
+    )
+    context_large_tool_threshold: int = Field(
+        default=5000,
+        description="触发单条工具结果独立压缩的 token 阈值",
+    )
+
     # === Harness 配置 ===
     supervisor_enabled: bool = Field(default=True, description="是否启用运行时监督器 (RuntimeSupervisor)")
     task_budget_tokens: int = Field(default=0, description="单次任务最大 token 消耗 (0=不限制)")
@@ -633,6 +671,9 @@ _PERSISTABLE_KEYS: list[str] = [
     "ui_language",
     "multi_agent_enabled",
     "im_bots",
+    "force_tool_call_max_retries",
+    "force_tool_call_im_floor",
+    "confirmation_text_max_retries",
 ]
 
 
